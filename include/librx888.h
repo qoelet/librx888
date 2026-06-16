@@ -33,6 +33,17 @@ typedef struct rx888_dev rx888_dev_t;
 
 
 
+/*!
+ * Upload the bundled SDDC firmware to any RX888-family device found in FX3
+ * bootloader mode (USB 04b4:00f3). The FX3 stores firmware in volatile RAM, so
+ * this must run after every physical reconnect. Idempotent and safe to call
+ * unconditionally: does nothing (returns 0) when no bootloader-mode device is
+ * present (e.g. firmware already loaded and the device is 04b4:00f1).
+ *
+ * \return number of devices flashed (>= 0), or a negative libusb error code
+ */
+int rx888_load_firmware(void);
+
 uint32_t rx888_get_device_count(void);
 
 const char* rx888_get_device_name(uint32_t index);
@@ -74,6 +85,17 @@ enum rx888_device {
 };
 
 int rx888_set_hf_attenuation(rx888_dev_t *dev, double rf_gain);
+
+/*!
+ * Set the HF AD8370 VGA ("IF") gain by step index.
+ *
+ * \param dev the device handle given by rx888_open()
+ * \param gain_index 0..126; higher = more gain. Roughly -25 dB (0) to +33 dB
+ *        (126). The RX888 powers this stage up muted, so a nonzero value is
+ *        required to hear weak signals. rx888_open() defaults it to ~23 dB.
+ * \return 0 on success
+ */
+int rx888_set_if_gain(rx888_dev_t *dev, int gain_index);
 
 /*!
  * Set the sample rate for the device.

@@ -12,8 +12,11 @@ target_include_directories(rx888 PUBLIC
   $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>  # <prefix>/include
   ${LIBUSB_INCLUDE_DIRS}
-  
+
   )
+
+# bundled FX3 firmware header (sddc_fx3_firmware.h) — implementation detail
+target_include_directories(rx888 PRIVATE ${CMAKE_SOURCE_DIR}/firmware)
 
 ########################################################################
 # Build utility
@@ -22,12 +25,18 @@ add_executable(rx888_test rx888_test.c)
 add_executable(rx888_rec rx888_rec.c)
 set(INSTALL_TARGETS rx888_test rx888)
 
+# Let the installed CLI tools find librx888 (its install_name is @rpath/...)
+# by baking the install libdir into their runtime search path. Without this,
+# `rx888_rec` aborts with "no LC_RPATH's found" on macOS.
+set_target_properties(rx888_test rx888_rec PROPERTIES
+    INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}")
+
 target_link_libraries(rx888_test rx888
-    ${LIBUSB_LINK_LIBRARIES}
+    PkgConfig::LIBUSB
     ${CMAKE_THREAD_LIBS_INIT}
 )
 target_link_libraries(rx888_rec rx888
-    ${LIBUSB_LINK_LIBRARIES}
+    PkgConfig::LIBUSB
     ${CMAKE_THREAD_LIBS_INIT}
 )
 

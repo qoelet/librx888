@@ -13,7 +13,14 @@ if(NOT CMAKE_BUILD_TYPE)
    message(STATUS "Build type not specified: defaulting to release.")
 endif(NOT CMAKE_BUILD_TYPE)
 
-set(CMAKE_C_FLAGS "-std=c11 -pedantic-errors -Wall -Wextra -Werror")
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+option(RX888_STRICT "Treat warnings as errors (maintainers)" OFF)
+add_compile_options(-Wall -Wextra)
+if(RX888_STRICT)
+    add_compile_options(-Werror)
+endif()
 
 include(GNUInstallDirs)
 include(GenerateExportHeader)

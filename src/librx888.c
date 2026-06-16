@@ -35,6 +35,7 @@
 
 #include <libusb.h>
 #include "librx888.h"
+#include "sddc_fx3_firmware.h"
 
 enum rx888_async_status {
     RX888_INACTIVE = 0,
@@ -47,8 +48,19 @@ enum rx888_command {
     STARTADC = 0xB2,
     STOPFX3 = 0xAB,
     R820T2STDBY = 0xB8,
-    GPIOFX3 = 0xAD
+    GPIOFX3 = 0xAD,
+    SETARGFX3 = 0xB6   /* set an argument: wIndex=arg, wValue=value */
 };
+
+/* SETARGFX3 argument indices (from the SDDC firmware) */
+enum rx888_argument {
+    DAT31_ATT  = 10,   /* HF step attenuator, value 0..63 (0.5 dB steps; 0 = 0 dB) */
+    AD8340_VGA = 11    /* HF AD8370 VGA, value 0..255 (see rx888_set_if_gain) */
+};
+
+/* AD8370 VGA gain-index mapping (matches SDDC RX888R2 host) */
+#define RX888_IF_GAIN_MAX_INDEX 126
+#define RX888_IF_GAIN_SWEET_POINT 18
 
 // Bitmasks for GPIO pins
 enum GPIOPin {
@@ -108,6 +120,13 @@ static rx888_t known_devices[] = {
 #define DEFAULT_BUF_LENGTH  (1024 * 16 * 8)
 #define CTRL_TIMEOUT 0
 
+/* FX3 in bootloader mode (firmware not yet loaded into its volatile RAM) */
+#define FX3_BOOTLOADER_VID 0x04b4
+#define FX3_BOOTLOADER_PID 0x00f3
+#define FX3_RAM_WRITE      0xA0   /* Cypress vendor request: RAM download */
+#define FX3_MAX_CHUNK      2048   /* max bytes per control transfer */
+#define FX3_FW_TIMEOUT     3000   /* ms */
+
 static int rx888_send_command(struct libusb_device_handle *dev_handle,
                                  enum rx888_command cmd,uint32_t data)
 {
@@ -125,32 +144,173 @@ static int rx888_send_command(struct libusb_device_handle *dev_handle,
   return 0;
 }
 
+/* Upload a Cypress CYFX2 RAM image to an FX3 in bootloader mode, then jump to
+ * its entry point. Image layout: 'C','Y', bImageCTL, bImageType, followed by
+ * sections of { uint32 length-in-words, uint32 load-address, data... }. A
+ * section with length 0 terminates the list; its address is the entry point. */
+static int fx3_ram_download(libusb_device_handle *h,
+                            const unsigned char *img, unsigned int len)
+{
+    if (len < 8 || img[0] != 'C' || img[1] != 'Y') {
+        fprintf(stderr, "FX3 firmware: bad CYFX signature\n");
+        return -1;
+    }
+
+    unsigned int pos = 4;  /* skip signature + bImageCTL + bImageType */
+    for (;;) {
+        if (pos + 8 > len) {
+            fprintf(stderr, "FX3 firmware: truncated header\n");
+            return -1;
+        }
+        uint32_t dwLen, dwAddr;
+        memcpy(&dwLen,  img + pos, 4); pos += 4;
+        memcpy(&dwAddr, img + pos, 4); pos += 4;
+
+        if (dwLen == 0) {
+            /* terminator: dwAddr is the program entry point — start firmware */
+            int r = libusb_control_transfer(
+                h, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
+                FX3_RAM_WRITE, dwAddr & 0xffff, (dwAddr >> 16) & 0xffff,
+                NULL, 0, FX3_FW_TIMEOUT);
+            /* the device resets and re-enumerates after the jump, so an error
+             * on this final transfer is expected and harmless */
+            if (r < 0)
+                fprintf(stderr, "FX3 firmware: jump to 0x%08x -> %s (benign)\n",
+                        dwAddr, libusb_error_name(r));
+            return 0;
+        }
+
+        uint32_t nbytes = dwLen * 4;
+        if (pos + nbytes > len) {
+            fprintf(stderr, "FX3 firmware: section overruns image\n");
+            return -1;
+        }
+        for (uint32_t done = 0; done < nbytes; ) {
+            uint32_t chunk = nbytes - done;
+            if (chunk > FX3_MAX_CHUNK) chunk = FX3_MAX_CHUNK;
+            uint32_t addr = dwAddr + done;
+            int r = libusb_control_transfer(
+                h, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
+                FX3_RAM_WRITE, addr & 0xffff, (addr >> 16) & 0xffff,
+                (unsigned char *)(img + pos + done), (uint16_t)chunk,
+                FX3_FW_TIMEOUT);
+            if (r != (int)chunk) {
+                fprintf(stderr, "FX3 firmware: write @0x%08x -> %s\n",
+                        addr, libusb_error_name(r));
+                return -1;
+            }
+            done += chunk;
+        }
+        pos += nbytes;
+    }
+}
+
+int rx888_load_firmware(void)
+{
+    libusb_context *ctx;
+    int r = libusb_init(&ctx);
+    if (r < 0)
+        return r;
+
+    libusb_device **list;
+    ssize_t cnt = libusb_get_device_list(ctx, &list);
+    int flashed = 0;
+
+    for (ssize_t i = 0; i < cnt; i++) {
+        struct libusb_device_descriptor dd;
+        if (libusb_get_device_descriptor(list[i], &dd) < 0)
+            continue;
+        if (dd.idVendor != FX3_BOOTLOADER_VID ||
+            dd.idProduct != FX3_BOOTLOADER_PID)
+            continue;
+
+        libusb_device_handle *h;
+        if (libusb_open(list[i], &h) < 0)
+            continue;
+#ifndef _WIN32
+        libusb_set_auto_detach_kernel_driver(h, 1); /* no-op on macOS */
+#endif
+        /* EP0 control transfers don't require a claimed interface; claim
+         * best-effort so we don't fight another opener, but proceed anyway. */
+        libusb_claim_interface(h, 0);
+        fprintf(stderr, "RX888: FX3 in bootloader mode, uploading firmware...\n");
+        if (fx3_ram_download(h, sddc_fx3_firmware, sddc_fx3_firmware_len) == 0)
+            flashed++;
+        libusb_release_interface(h, 0);
+        libusb_close(h);
+    }
+
+    libusb_free_device_list(list, 1);
+    libusb_exit(ctx);
+
+    if (flashed > 0) {
+        /* wait for the FX3 to reset and re-enumerate as 04b4:00f1 (~1-2 s) */
+        for (int waited = 0; waited < 50; waited++) {  /* up to ~5 s */
+            if (rx888_get_device_count() > 0)
+                break;
+#ifdef _WIN32
+            Sleep(100);
+#else
+            nanosleep((const struct timespec[]){{0, 100000000L}}, NULL);
+#endif
+        }
+    }
+
+    return flashed;
+}
+
+/* Set a firmware argument (DAT-31 attenuator, AD8370 VGA, ...) via SETARGFX3.
+ * The value goes in wValue and the argument selector in wIndex; a single dummy
+ * data byte is sent. Mirrors the SDDC host's fx3handler::SetArgument. */
+static int rx888_set_argument(struct libusb_device_handle *dev_handle,
+                              uint16_t index, uint16_t value)
+{
+    uint8_t data = 0;
+    int ret = libusb_control_transfer(
+        dev_handle, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
+        SETARGFX3, value, index, &data, sizeof(data), CTRL_TIMEOUT);
+    if (ret < 0) {
+        fprintf(stderr, "SetArgument(idx=%u,val=%u) failed: %s\n",
+                index, value, libusb_error_name(ret));
+        return -1;
+    }
+    return 0;
+}
+
+int rx888_set_if_gain(rx888_dev_t *dev, int gain_index)
+{
+    if (!dev)
+        return -1;
+
+    if (gain_index < 0)
+        gain_index = 0;
+    if (gain_index > RX888_IF_GAIN_MAX_INDEX)
+        gain_index = RX888_IF_GAIN_MAX_INDEX;
+
+    /* AD8370 has a low-gain and a high-gain range, selected by bit 7 */
+    uint8_t gain;
+    if (gain_index > RX888_IF_GAIN_SWEET_POINT)
+        gain = 0x80 | (uint8_t)(gain_index - RX888_IF_GAIN_SWEET_POINT + 3);
+    else
+        gain = (uint8_t)(gain_index + 1);
+
+    return rx888_set_argument(dev->dev_handle, AD8340_VGA, gain);
+}
+
 int rx888_set_hf_attenuation(rx888_dev_t *dev, double rf_gain)
 {
     if (!dev)
         return -1;
 
-    // Verify that rf_gain is one of the expected values
-    if (rf_gain != 0.0 && rf_gain != -10.0 && rf_gain != -20.0)
-        return -1;
+    /* rf_gain is attenuation in dB (<= 0). The DAT-31 attenuator takes
+     * 0..63 in 0.5 dB steps (0 = 0 dB, 63 = -31.5 dB). */
+    int steps = (int)(-rf_gain * 2.0 + 0.5);
+    if (steps < 0)
+        steps = 0;
+    if (steps > 63)
+        steps = 63;
 
-    // Set the HF attenuation
-    if (rf_gain == 0.0) {
-        dev->gpio_state &= ~ATT_SEL0; // Clear the bit 13
-        dev->gpio_state |= ATT_SEL1; // Set the bit 14
-        } 
-    else if (rf_gain == -10.0) {
-        dev->gpio_state |= ATT_SEL0; // Set the bit 13
-        dev->gpio_state |= ATT_SEL1; // Set the bit 14
-        }
-    else if (rf_gain == -20.0) {
-        dev->gpio_state |= ATT_SEL0; // Set the bit 13
-        dev->gpio_state &= ~ATT_SEL1; // Clear the bit 14
-        }
-
-    rx888_send_command(dev->dev_handle, GPIOFX3, dev->gpio_state);
-
-    return 0;
+    return rx888_set_argument(dev->dev_handle, DAT31_ATT, (uint16_t)steps);
 }
 
 int rx888_set_sample_rate(rx888_dev_t *dev, uint32_t samp_rate)
@@ -442,6 +602,14 @@ int rx888_open(rx888_dev_t **out_dev, uint32_t index)
     rx888_send_command(dev->dev_handle, STOPFX3, 0);
     rx888_send_command(dev->dev_handle, STARTADC, dev->sample_rate);
     rx888_send_command(dev->dev_handle, STARTFX3, 0);
+
+    /* Wake up the HF front-end. The AD8370 VGA powers up effectively muted, so
+     * without this the receiver is deaf to weak antennas. Set zero input
+     * attenuation and a moderate default IF gain (~23 dB); the host can adjust
+     * both via rx888_set_hf_attenuation()/rx888_set_if_gain(). */
+    rx888_set_argument(dev->dev_handle, DAT31_ATT, 0);
+    rx888_set_if_gain(dev, 50);
+
     return 0;
 err:
     if (dev) {
